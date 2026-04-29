@@ -16,6 +16,8 @@ local lp = Players.LocalPlayer
 --  STATE
 -- ═══════════════════════════════════════════
 local AuraEnabled       = false
+local HitboxSize        = 80
+local Range             = 35
 local currentTarget     = nil
 local AutoTargetEnabled = true
 
@@ -29,6 +31,19 @@ local FloatHeight  = 10
 
 local CurrentSpeed       = 25
 local SpeedMin, SpeedMax = 5, 200
+
+-- ═══════════════════════════════════════════
+--  ATTACK SPEED STATE
+-- ═══════════════════════════════════════════
+-- Layer architecture (3 layers):
+--   L1 → AnimationTrack.AdjustSpeed   : speed up non-looped (attack) anims
+--   L2 → __namecall FireServer burst  : extra hits per attack press
+--   L3 → hookfunction task.wait       : compress client debounce waits
+local AtkSpeedEnabled   = false
+local AtkSpeedMult      = 2
+local AtkSpdMin, AtkSpdMax = 1, 10
+local _atkMT, _atkOldNC = nil, nil
+local _atkDetName       = "none"
 
 -- FLIGHT
 local FlightEnabled  = false
@@ -133,6 +148,8 @@ local function disableAlwaysRagdoll()
     local h = lp.Character and lp.Character:FindFirstChild("Humanoid")
     if h then h:ChangeState(Enum.HumanoidStateType.Running) end
 end
+
+
 
 -- ═══════════════════════════════════════════════════════════════
 --  FLIGHT MODE
@@ -293,8 +310,58 @@ local function stopFlight()
 end
 
 -- ═══════════════════════════════════════════════════════════════
---  BLOCK SYSTEM (Immune)
+--  ATTACK SPEED  [targeted — RF.Hit InvokeServer]
+--
+--  Remote confirmed: ReplicatedStorage.Packages.Knit.Services
+--                    .CombatService.RF.Hit  (RemoteFunction)
+--  Method: InvokeServer — bukan FireServer!
+--  Versi lama gagal karena semua hook check FireServer/RemoteEvent.
+--
+--  Sistem:
+--   L1 : AnimationPlayed → AdjustSpeed sekali, zero frame cost.
+--   L2 : Hook __namecall, filter exact self == _HitRemote + "InvokeServer"
+--        Capture args + lockedAt.
+--        Replay: _replayFlag=true → call _HitRemote:InvokeServer(patchedArgs)
+--        → masuk hook lagi tapi _replayFlag skip capture → jatuh ke
+--        _atkOldNC(self,...) yang execute InvokeServer asli. Tidak infinite loop.
+--   Timestamp patch: scan args untuk angka mirip tick()/os.clock(), update
+--        ke nilai terkini sebelum tiap replay.
 -- ═══════════════════════════════════════════════════════════════
+
+-- ── Find remote on load ───────────────────────────────────────
+local _HitRemote = nil
+task.spawn(function()
+    local ok, r = pcall(function()
+        return game:GetService("ReplicatedStorage")
+            :WaitForChild("Packages",      15)
+            :WaitForChild("Knit",          15)
+            :WaitForChild("Services",      15)
+            :WaitForChild("CombatService", 15)
+            :WaitForChild("RF",            15)
+            :WaitForChild("Hit",           15)
+    end)
+    if ok and r then
+        _HitRemote  = r
+        _atkDetName = "RF.Hit [ready]"
+        task.delay(0.1, function()
+            if atkStatLbl then
+                atkStatLbl.Text      = "  ✓ RF.Hit ditemukan — siap dipakai"
+                atkStatLbl.TextColor3= Color3.fromRGB(40,240,130)
+            end
+        end)
+        print("[AtkSpeed] RF.Hit found:", r:GetFullName())
+    else
+        warn("[AtkSpeed] RF.Hit tidak ditemukan dalam 15s!")
+        task.delay(0.1, function()
+            if atkStatLbl then
+                atkStatLbl.Text      = "  ✗ RF.Hit tidak ditemukan"
+                atkStatLbl.TextColor3= Color3.fromRGB(255,60,60)
+            end
+        end)
+    end
+end)
+
+-- ── Block Remote + Auto Block ─────────────────────────────────
 local _BlockRemote    = nil
 local AutoBlockEnabled = false
 local _blockHB        = nil
@@ -348,7 +415,7 @@ local function disableAutoBlock()
     if char then char:SetAttribute("Blocking", false) end
 end
 
--- Burst block saat grabbed — aktif selalu
+-- Burst block saat grabbed — aktif selalu, bukan hanya saat Immune ON
 lp:GetAttributeChangedSignal("Grabbed"):Connect(function()
     if not lp:GetAttribute("Grabbed") then return end
     if not _BlockRemote then return end
@@ -418,6 +485,184 @@ local function stopGrabLoopIfIdle()
     if NoGrabCool or AutoGrabEnabled then return end
     if _grabHB then _grabHB:Disconnect(); _grabHB=nil end
 end
+
+-- ── L1: Event-driven anim boost ──────────────────────────────
+local _animConn = nil
+local function _connectAnimBoost()
+    if _animConn then _animConn:Disconnect(); _animConn=nil end
+    local char = lp.Character; if not char then return end
+    local hum  = char:FindFirstChild("Humanoid"); if not hum then return end
+    local anim = hum:FindFirstChildOfClass("Animator"); if not anim then return end
+    _animConn = anim.AnimationPlayed:Connect(function(track)
+        if not AtkSpeedEnabled or track.Looped then return end
+        pcall(function() track:AdjustSpeed(AtkSpeedMult) end)
+        track.Stopped:Connect(function()
+            pcall(function() track:AdjustSpeed(1) end)
+        end)
+    end)
+end
+
+local function _disconnectAnimBoost()
+    if _animConn then _animConn:Disconnect(); _animConn=nil end
+    pcall(function()
+        local char = lp.Character; if not char then return end
+        local hum  = char:FindFirstChild("Humanoid"); if not hum then return end
+        local anim = hum:FindFirstChildOfClass("Animator"); if not anim then return end
+        for _, tr in ipairs(anim:GetPlayingAnimationTracks()) do
+            if not tr.Looped then pcall(function() tr:AdjustSpeed(1) end) end
+        end
+    end)
+end
+
+-- ── L2: Hook CombatClient punch — bypass debounce 0.35s ─────
+-- CombatClient pakai v_u_27 (lastHitTick) cek tick()-v_u_27 < 0.35
+-- Kita hook __namecall: setiap :Hit() → auto spam ulang via task.spawn
+-- tanpa lewat debounce client karena kita panggil langsung ke remote
+local _capture     = nil
+local _replayFlag  = false
+local _replayAccum = 0
+local _replayHB    = nil
+
+-- Patch timestamp args sebelum replay
+local function _patchTimestamps(argsPacked)
+    local nt = tick()
+    local nc = os.clock()
+    local out = { n = argsPacked.n }
+    for i = 1, argsPacked.n do
+        local v = argsPacked[i]
+        if type(v) == "number" then
+            if     v >= nc - 120 and v <= nc + 2 then out[i] = nc
+            elseif v >= nt - 120 and v <= nt + 2 then out[i] = nt
+            else                                       out[i] = v  end
+        else
+            out[i] = v
+        end
+    end
+    return out
+end
+
+-- Replay loop: tiap Heartbeat langsung fire Hit remote, bypass client debounce
+local function _startReplayLoop()
+    if _replayHB then return end
+    _replayHB = RunService.Heartbeat:Connect(function()
+        if not AtkSpeedEnabled then return end
+        if not _capture        then return end
+        if not _HitRemote      then return end
+        local pa = _patchTimestamps(_capture.args)
+        _replayFlag = true
+        -- task.spawn biar tidak blocking, fire sebanyak AtkSpeedMult kali per frame
+        for i = 1, math.max(1, AtkSpeedMult) do
+            task.spawn(function()
+                pcall(function()
+                    _HitRemote:InvokeServer(table.unpack(pa, 1, pa.n))
+                end)
+            end)
+        end
+        _replayFlag = false
+    end)
+end
+
+local function _stopReplayLoop()
+    if _replayHB then _replayHB:Disconnect(); _replayHB=nil end
+    _capture = nil; _replayAccum = 0; _replayFlag = false
+end
+
+local function _enableAtkNamecall()
+    if _atkOldNC then return end
+    local ok = pcall(function()
+        _atkMT    = getrawmetatable(game)
+        _atkOldNC = _atkMT.__namecall
+        setreadonly(_atkMT, false)
+        _atkMT.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+
+            -- Capture HANYA dari RF.Hit + InvokeServer + bukan replay kita
+            if not _replayFlag
+               and AtkSpeedEnabled
+               and method == "InvokeServer"
+               and self == _HitRemote
+            then
+                local now = os.clock()
+                _capture = {
+                    args     = table.pack(...),
+                    lockedAt = now,
+                }
+                if atkStatLbl then
+                    atkStatLbl.Text      = "  ⚡ Replaying RF.Hit x"..AtkSpeedMult
+                    atkStatLbl.TextColor3= Color3.fromRGB(255,140,30)
+                end
+            end
+
+            return _atkOldNC(self, ...)
+        end)
+        setreadonly(_atkMT, true)
+    end)
+    if not ok then
+        warn("[AtkSpeed] __namecall hook gagal.")
+        if atkStatLbl then
+            atkStatLbl.Text      = "  ✗ Hook gagal — coba executor lain"
+            atkStatLbl.TextColor3= Color3.fromRGB(255,60,60)
+        end
+    end
+end
+
+local function _disableAtkNamecall()
+    pcall(function()
+        if _atkMT and _atkOldNC then
+            setreadonly(_atkMT, false)
+            _atkMT.__namecall = _atkOldNC
+            setreadonly(_atkMT, true)
+        end
+    end)
+    _atkOldNC = nil
+end
+
+-- Master enable/disable
+local function enableAtkSpeed()
+    _capture = nil
+    _connectAnimBoost()
+    _enableAtkNamecall()
+    _startReplayLoop()
+    if atkStatLbl then
+        if _HitRemote then
+            atkStatLbl.Text      = "  ✓ RF.Hit siap — mukul musuh!"
+            atkStatLbl.TextColor3= Color3.fromRGB(40,240,130)
+        else
+            atkStatLbl.Text      = "  ⏳ Mencari RF.Hit..."
+            atkStatLbl.TextColor3= Color3.fromRGB(0,220,255)
+        end
+    end
+end
+
+local function disableAtkSpeed()
+    _disconnectAnimBoost()
+    _stopReplayLoop()
+    _disableAtkNamecall()
+    if atkStatLbl then
+        atkStatLbl.Text      = "  Remote: RF.Hit"
+        atkStatLbl.TextColor3= Color3.fromRGB(110,110,155)
+    end
+end
+
+lp.CharacterAdded:Connect(function()
+    task.wait(1)
+    _capture = nil   -- stale Instance refs di args → invalid setelah respawn
+    if AtkSpeedEnabled then
+        _connectAnimBoost()
+        if atkStatLbl then
+            atkStatLbl.Text      = "  ⏸ Respawn — mukul lagi untuk mulai"
+            atkStatLbl.TextColor3= Color3.fromRGB(110,110,155)
+        end
+    end
+end)
+
+
+
+-- ═══════════════════════════════════════════
+--  HITBOX STATE
+-- ═══════════════════════════════════════════
+local origSizes={};local origTrans={};local origCC={};local expanded={}
+local ownSize=nil;local ownTrans=nil
 
 -- ═══════════════════════════════════════════════════════════════
 --  CYBERPUNK NEON PALETTE
@@ -655,7 +900,8 @@ local hDiv = Instance.new("Frame", Hdr)
 hDiv.Size=UDim2.new(1,0,0,1); hDiv.Position=UDim2.new(0,0,1,-1)
 hDiv.BackgroundColor3=C.p0; hDiv.BackgroundTransparency=0.3; hDiv.ZIndex=4
 
--- Minimize btnlocal MinBtn = Instance.new("TextButton", Hdr)
+-- Minimize btn
+local MinBtn = Instance.new("TextButton", Hdr)
 MinBtn.Size=UDim2.new(0,24,0,22); MinBtn.Position=UDim2.new(1,-30,0.5,-11)
 MinBtn.BackgroundColor3=C.pDim; MinBtn.Text="—"; MinBtn.TextColor3=C.p2
 MinBtn.Font=Enum.Font.GothamBlack; MinBtn.TextSize=13
@@ -780,6 +1026,33 @@ for i=1,#TABS do local idx=i tBtns[i].MouseButton1Click:Connect(function() switc
 -- ═══════════════════════════════════════════════════════════════
 local P1=pages[1]; local y1=7
 
+-- ── FIO AURA MODE (Attack Speed) — paling atas ───────────────
+sec(P1,y1,"FIO AURA MODE",C.or1); y1=y1+23
+
+local AtkSpeedBtn=Instance.new("TextButton",P1)
+AtkSpeedBtn.Size=UDim2.new(1,-12,0,42); AtkSpeedBtn.Position=UDim2.new(0,6,0,y1)
+AtkSpeedBtn.BackgroundColor3=C.bg0
+AtkSpeedBtn.Text="🥊  FIO AURA MODE  ·  OFF"
+AtkSpeedBtn.TextColor3=C.or1; AtkSpeedBtn.Font=Enum.Font.GothamBlack; AtkSpeedBtn.TextSize=12
+AtkSpeedBtn.AutoButtonColor=false; AtkSpeedBtn.ZIndex=5; cr(AtkSpeedBtn,9)
+local atkSpeedSK=sk(AtkSpeedBtn,C.or1,1.5,0.35)
+local atkLine=Instance.new("Frame",AtkSpeedBtn)
+atkLine.Size=UDim2.new(1,0,0,2); atkLine.Position=UDim2.new(0,0,1,-2)
+atkLine.BackgroundColor3=C.or1; atkLine.BackgroundTransparency=0.4; atkLine.ZIndex=6
+y1=y1+49
+
+-- Speed multiplier numRow
+local atkM,atkV,atkP=numRow(P1,y1,"⚡","Hit Speed (x)",C.or1,AtkSpeedMult); y1=y1+44
+
+-- Status indicator
+local atkStatCard=Instance.new("Frame",P1)
+atkStatCard.Size=UDim2.new(1,-12,0,28); atkStatCard.Position=UDim2.new(0,6,0,y1)
+atkStatCard.BackgroundColor3=C.bg0; atkStatCard.ZIndex=5; cr(atkStatCard,6)
+sk(atkStatCard,C.or0,1,0.5)
+local atkStatLbl=tx(atkStatCard,"  Remote: none detected",9,C.t1,Enum.Font.Gotham,6)
+atkStatLbl.Size=UDim2.new(1,0,1,0); atkStatLbl.TextXAlignment=Enum.TextXAlignment.Left
+y1=y1+35
+
 -- AURA — hero button
 sec(P1,y1,"AURA",C.cy1); y1=y1+23
 local AuraBtn = Instance.new("TextButton", P1)
@@ -859,6 +1132,9 @@ P3.CanvasSize=UDim2.new(0,0,0,y3+4)
 --  PAGE 4 — CONFIG
 -- ═══════════════════════════════════════════════════════════════
 local P4=pages[4]; local y4=7
+sec(P4,y4,"HITBOX & RANGE",C.pk1); y4=y4+23
+local hbM,hbV,hbP=numRow(P4,y4,"📦","Hitbox Size",C.pk1,HitboxSize); y4=y4+44
+local rnM,rnV,rnP=numRow(P4,y4,"📡","Auto Range", C.yl1,Range);     y4=y4+48
 sec(P4,y4,"ORBIT",C.cy1); y4=y4+23
 local orRM,orRV,orRP=numRow(P4,y4,"🌀","Orbit Radius",C.cy1,orbitRadius); y4=y4+44
 local orSM,orSV,orSP=numRow(P4,y4,"💨","Orbit Speed", C.p2, orbitSpeed);  y4=y4+48
@@ -1146,6 +1422,48 @@ UserInputService.InputEnded:Connect(function(i)
 end)
 
 -- ═══════════════════════════════════════════════════════════════
+--  HITBOX HELPERS
+-- ═══════════════════════════════════════════════════════════════
+local function shrinkOwn()
+    local c=lp.Character; if not c then return end
+    local hrp=c:FindFirstChild("HumanoidRootPart")
+    if hrp and not ownSize then
+        ownSize=hrp.Size; ownTrans=hrp.Transparency
+        local cf=hrp.CFrame
+        hrp.Size=Vector3.new(3,3,3); hrp.CFrame=cf
+        hrp.Transparency=1; hrp.LocalTransparencyModifier=1
+    end
+end
+local function restoreOwn()
+    local c=lp.Character
+    if c and ownSize then
+        local hrp=c:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local cf=hrp.CFrame; hrp.Size=ownSize; hrp.CFrame=cf
+            hrp.Transparency=ownTrans or 0; hrp.LocalTransparencyModifier=0
+        end
+        ownSize=nil; ownTrans=nil
+    end
+end
+local function applyHB(hrp)
+    if not hrp or not hrp.Parent then return end
+    if not origSizes[hrp] then
+        origSizes[hrp]=hrp.Size; origTrans[hrp]=hrp.Transparency; origCC[hrp]=hrp.CanCollide
+    end
+    local cf=hrp.CFrame; hrp.CanCollide=false
+    hrp.Size=Vector3.new(HitboxSize,HitboxSize,HitboxSize); hrp.CFrame=cf
+    hrp.Transparency=1; hrp.LocalTransparencyModifier=1; expanded[hrp]=true
+end
+local function restoreHB(hrp)
+    if origSizes[hrp] and hrp and hrp.Parent then
+        local cf=hrp.CFrame; hrp.CanCollide=origCC[hrp] or false
+        hrp.Size=origSizes[hrp]; hrp.CFrame=cf
+        hrp.Transparency=origTrans[hrp] or 0; hrp.LocalTransparencyModifier=0
+    end
+    expanded[hrp]=nil; origSizes[hrp]=nil; origTrans[hrp]=nil; origCC[hrp]=nil
+end
+
+-- ═══════════════════════════════════════════════════════════════
 --  PLAYER LIST
 -- ═══════════════════════════════════════════════════════════════
 local function refreshList()
@@ -1224,12 +1542,13 @@ local function setAura(on)
     if on then
         AuraBtn.Text="⚡  MANUAL AURA  ·  ON"; AuraBtn.TextColor3=C.cy2
         AuraBtn.BackgroundColor3=C.cyDim; auraSK.Color=C.cy1; auraSK.Transparency=0.15
-        auraLine.BackgroundColor3=C.cy1
+        auraLine.BackgroundColor3=C.cy1; shrinkOwn()
     else
         AuraBtn.Text="⚡  MANUAL AURA  ·  OFF"; AuraBtn.TextColor3=C.cy1
         AuraBtn.BackgroundColor3=C.bg0; auraSK.Color=C.cy1; auraSK.Transparency=0.35
         auraLine.BackgroundColor3=C.cy1
-        currentTarget=nil
+        for h in pairs(expanded) do restoreHB(h) end
+        restoreOwn(); currentTarget=nil
         OrbitEnabled=false
         OrbitBtn.Text="🔄  ORBIT LOCK  ·  OFF"; OrbitBtn.TextColor3=C.cy1
         OrbitBtn.BackgroundColor3=C.bg2; orbitSK.Color=C.border; orbitSK.Transparency=0.5
@@ -1395,16 +1714,50 @@ lp:GetAttributeChangedSignal("Fighting"):Connect(function()
     end
 end)
 
--- Numeric controls
+-- ATTACK SPEED toggle
+AtkSpeedBtn.Activated:Connect(function()
+    AtkSpeedEnabled = not AtkSpeedEnabled
+    if AtkSpeedEnabled then
+        AtkSpeedBtn.Text="🥊  FIO AURA MODE  ·  ON"; AtkSpeedBtn.TextColor3=C.or1
+        AtkSpeedBtn.BackgroundColor3=C.orDim; atkSpeedSK.Color=C.or1; atkSpeedSK.Transparency=0.2
+        atkLine.BackgroundColor3=C.or1; atkLine.BackgroundTransparency=0.2
+        atkStatLbl.Text="  ⚡ L1+L2+L3 aktif — coba serang"; atkStatLbl.TextColor3=C.gn1
+        enableAtkSpeed()
+    else
+        AtkSpeedBtn.Text="🥊  FIO AURA MODE  ·  OFF"; AtkSpeedBtn.TextColor3=C.or1
+        AtkSpeedBtn.BackgroundColor3=C.bg0; atkSpeedSK.Color=C.or1; atkSpeedSK.Transparency=0.4
+        atkLine.BackgroundColor3=C.or1; atkLine.BackgroundTransparency=0.4
+        atkStatLbl.Text="  Remote: none detected"; atkStatLbl.TextColor3=C.t1
+        disableAtkSpeed()
+    end
+end)
+
+-- Numeric control untuk AtkSpeedMult
+atkM.MouseButton1Click:Connect(function()
+    AtkSpeedMult=math.max(AtkSpdMin, AtkSpeedMult-1)
+    atkV.Text=tostring(AtkSpeedMult)
+end)
+atkP.MouseButton1Click:Connect(function()
+    AtkSpeedMult=math.min(AtkSpdMax, AtkSpeedMult+1)
+    atkV.Text=tostring(AtkSpeedMult)
+end)
+
+-- Update status label sudah inline di _autoSelectCapture dan _startReplayLoop
+
 spdM.MouseButton1Click:Connect(function() CurrentSpeed=math.max(SpeedMin,CurrentSpeed-5);spdV.Text=tostring(CurrentSpeed) end)
 spdP.MouseButton1Click:Connect(function() CurrentSpeed=math.min(SpeedMax,CurrentSpeed+5);spdV.Text=tostring(CurrentSpeed) end)
 fltM.MouseButton1Click:Connect(function() FloatHeight=math.max(1,FloatHeight-1);fltV.Text=tostring(FloatHeight) end)
 fltP.MouseButton1Click:Connect(function() FloatHeight=math.min(50,FloatHeight+1);fltV.Text=tostring(FloatHeight) end)
+hbM.MouseButton1Click:Connect(function() HitboxSize=math.max(10,HitboxSize-5);hbV.Text=tostring(HitboxSize) end)
+hbP.MouseButton1Click:Connect(function() HitboxSize=math.min(200,HitboxSize+5);hbV.Text=tostring(HitboxSize) end)
+rnM.MouseButton1Click:Connect(function() Range=math.max(5,Range-5);rnV.Text=tostring(Range) end)
+rnP.MouseButton1Click:Connect(function() Range=math.min(150,Range+5);rnV.Text=tostring(Range) end)
 orRM.MouseButton1Click:Connect(function() orbitRadius=math.max(2,orbitRadius-1);orRV.Text=tostring(orbitRadius) end)
 orRP.MouseButton1Click:Connect(function() orbitRadius=math.min(30,orbitRadius+1);orRV.Text=tostring(orbitRadius) end)
 orSM.MouseButton1Click:Connect(function() orbitSpeed=math.max(1,orbitSpeed-1);orSV.Text=tostring(orbitSpeed) end)
 orSP.MouseButton1Click:Connect(function() orbitSpeed=math.min(30,orbitSpeed+1);orSV.Text=tostring(orbitSpeed) end)
 RstBtn.MouseButton1Click:Connect(function() CurrentSpeed=25;spdV.Text="25" end)
+
 
 -- ═══════════════════════════════════════════════════════════════
 --  MAIN HEARTBEAT LOOP
@@ -1437,6 +1790,7 @@ RunService.Heartbeat:Connect(function(dt)
         local tHRP=tChar:FindFirstChild("HumanoidRootPart")
         local tHum=tChar:FindFirstChild("Humanoid")
         if tHRP and tHum and tHum.Health>0 then
+            applyHB(tHRP)
             if OrbitEnabled then
                 orbitAngle=orbitAngle+orbitSpeed*dt
                 local tp=tHRP.Position
@@ -1452,6 +1806,13 @@ RunService.Heartbeat:Connect(function(dt)
             currentTarget=nil;StatLbl.Text="  Target: None";refreshList()
         end
     end
+
+    for _,plr in ipairs(Players:GetPlayers()) do
+        if plr~=lp and plr~=currentTarget and plr.Character then
+            local hrp=plr.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then restoreHB(hrp) end
+        end
+    end
 end)
 
 -- ═══════════════════════════════════════════════════════════════
@@ -1459,7 +1820,9 @@ end)
 -- ═══════════════════════════════════════════════════════════════
 lp.CharacterAdded:Connect(function(char)
     task.wait(0.8)
+    ownSize=nil; ownTrans=nil
     saveJoints(char); updateHp()
+    if AuraEnabled          then shrinkOwn() end
     if AlwaysRagdollEnabled then task.wait(0.2); enableAlwaysRagdoll() end
     if FlightEnabled then
         stopFlight()
@@ -1473,7 +1836,7 @@ lp.CharacterAdded:Connect(function(char)
     end
 end)
 
-print("✅ FIO AURA v6.4 [CYBERPUNK] — Aura|Float|Orbit|Ragdoll|Flight | Loaded!")
+print("✅ FIO AURA v7.0 [CYBERPUNK] — Aura|Float|Orbit|Ragdoll|Flight|FioAuraMode | Loaded!")
 
 -- forceStopFly compat (beberapa game punya remote ini)
 pcall(function()
